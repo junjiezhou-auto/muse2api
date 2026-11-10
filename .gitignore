@@ -40,8 +40,14 @@ data/downloads/*
 !data/downloads/.gitkeep
 # 临时邮箱账号（含明文密码，用于接收 muse.ai 登录验证码）——绝不入库
 data/mail_accounts.txt
+data/tmp*
+data/chromium.log
+data/*.ndjson
 chrome-profile/
 muse2api-profiles/
+
+# 运行时渲染产物：media-proxy 的本地配置由模板 + MUSE2API_KEY 生成，绝不入库
+media-proxy/nginx.conf
 
 # Logs & Backups
 *.log
