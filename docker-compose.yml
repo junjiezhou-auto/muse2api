@@ -14,10 +14,20 @@ services:
       # 服务对外基准 URL，如 https://your-domain.com（留空则管理前端自动检测当前域名）
       - MUSE2API_PUBLIC_BASE=
       # 超时配置（秒）
-      - MUSE2API_IMAGE_TIMEOUT=240
-      - MUSE2API_VIDEO_TIMEOUT=600
-      - MUSE2API_CHAT_TIMEOUT=300
+      - MUSE2API_IMAGE_TIMEOUT=${MUSE2API_IMAGE_TIMEOUT:-240}
+      - MUSE2API_VIDEO_TIMEOUT=${MUSE2API_VIDEO_TIMEOUT:-600}
+      - MUSE2API_CHAT_TIMEOUT=${MUSE2API_CHAT_TIMEOUT:-300}
+      # 最大并发任务数（每个任务一个 Chromium 上下文）
+      - MUSE2API_CONCURRENCY=${MUSE2API_CONCURRENCY:-2}
+      # 生成工作池的排队上限（超出直接返回 429，不再无界建线程）
+      - MUSE2API_MAX_PENDING=${MUSE2API_MAX_PENDING:-64}
+      # 任务内存状态：完成后保留时长与最大条数（不再逐次全量写 tasks.json）
+      - MUSE2API_TASK_TTL_SECONDS=${MUSE2API_TASK_TTL_SECONDS:-3600}
+      - MUSE2API_TASK_MAX_ENTRIES=${MUSE2API_TASK_MAX_ENTRIES:-2048}
     volumes:
       # 持久化账号配置、任务日志及媒体文件
       - ./data:/app/data
     shm_size: '2gb' # 保证 Chromium 渲染多标签页时不因 /dev/shm 耗尽崩溃
+    # 内存上限：防止 Chromium 实例堆积把整台机器吃满（2026-11-08 OOM 事故后加）
+    mem_limit: 24g
+    memswap_limit: 24g

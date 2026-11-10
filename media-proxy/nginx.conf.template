@@ -1,0 +1,14 @@
+server {
+    listen 80;
+    # 只放行媒体目录，其余一律 404
+    location /v1/media/ {
+        proxy_pass http://host.docker.internal:18610;
+        # 上游需要管理 Key。这里用官方 nginx 镜像的 envsubst 模板机制，
+        # 启动时由 docker compose 注入 MUSE2API_KEY 渲染；仓库中不放任何真实密钥。
+        proxy_set_header Authorization "Bearer ${MUSE2API_KEY}";
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        add_header Cache-Control "public, max-age=3600";
+    }
+    location / { return 404; }
+}

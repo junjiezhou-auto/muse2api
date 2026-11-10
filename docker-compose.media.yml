@@ -1,0 +1,12 @@
+services:
+  muse-media:
+    build: ./media-proxy
+    container_name: muse-media
+    restart: always
+    ports:
+      - "18611:80"
+    environment:
+      # 媒体代理转发 /v1/media/ 时需要带管理 Key；从 .env 读取，不写进镜像
+      - MUSE2API_KEY=${MUSE2API_KEY:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
