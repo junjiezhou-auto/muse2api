@@ -13,6 +13,13 @@
   🤝 本开源项目已链接并认可 <b><a href="https://linux.do/" target="_blank">LINUX DO 社区 (https://linux.do/)</a></b> —— 新的理想型社区（真诚、友善、团结、专业）
 </p>
 
+> **本仓库是一份生产加固分支（fork）**：基于上游 [`czg86389-hub/muse2api`](https://github.com/czg86389-hub/muse2api) v1.6.9，
+> 面向「单机 20+ 账号、高并发、无人值守」的真实部署做了一轮稳定性改造：有界生成线程池与背压、
+> 任务内存化（不再逐次全量写 `tasks.json`）、CDP 断连 fail-fast、上下文生命周期强清理、
+> 按账号独立代理路由、媒体反代服务，以及 24G 内存上限 + 每日重启的运维配套。
+> 改动清单、新增环境变量与部署参数见 **[docs/PRODUCTION-NOTES.md](docs/PRODUCTION-NOTES.md)**。
+> 许可证仍为上游的 MIT。
+
 将 **[muse.ai](https://muse.ai/)** 网页端的前沿多模态能力逆向工程封装为标准的 **OpenAI 兼容 RESTful API**。通过无头浏览器 CDP 协议穿透、热备 WebSocket 隧道复用与动态 Session 管理，原生支持文本对话（2~3 秒级流式首字响应）、文生图、图生图编辑、文生视频、首帧图生视频，并提供多账号池亲和轮转、全自动 48 小时会话续期与云端 VM 唤醒保活，以及配套 Chrome 一键导号扩展。
 
 ---
