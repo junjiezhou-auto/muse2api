@@ -103,6 +103,11 @@ class Config:
     video_timeout: int = field(default_factory=lambda: int(_env("MUSE2API_VIDEO_TIMEOUT", "600")))
     chat_timeout: int = field(default_factory=lambda: int(_env("MUSE2API_CHAT_TIMEOUT", "300")))
     max_concurrency: int = field(default_factory=lambda: max(1, int(_env("MUSE2API_CONCURRENCY", "2"))))
+    # 运行任务仅在内存保留；终态按 TTL/容量回收，活动任务不会被淘汰。
+    max_pending: int = field(default_factory=lambda: max(1, int(_env("MUSE2API_MAX_PENDING", "64"))))
+    task_ttl_seconds: float = field(default_factory=lambda: max(1.0, float(_env("MUSE2API_TASK_TTL_SECONDS", "3600"))))
+    task_max_entries: int = field(default_factory=lambda: max(1, int(_env("MUSE2API_TASK_MAX_ENTRIES", "2048"))))
+    account_flush_interval: float = field(default_factory=lambda: max(0.05, float(_env("MUSE2API_ACCOUNT_FLUSH_INTERVAL", "1"))))
 
     # 参考图输入默认只允许调用方直接提供数据和公网 URL。
     # 仅可信单用户部署可显式设为 1 恢复服务器本地文件或私网抓取。

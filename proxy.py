@@ -176,6 +176,8 @@ class HTTPProxyRelay:
             credentials = (proxy.get("username", "") + ":" + proxy.get("password", "")).encode("latin-1")
             self.authorization = b"Basic " + base64.b64encode(credentials)
         self.closed = False
+        self._close_complete = False
+        self._close_lock = threading.Lock()
         self._sockets = set()
         self._lock = threading.Lock()
         self.server = _RelayServer(("127.0.0.1", 0), _RelayHandler)
@@ -244,17 +246,34 @@ class HTTPProxyRelay:
             self._sockets.discard(sock)
 
     def close(self):
-        with self._lock:
-            if self.closed:
+        # 'closed' rejects new traffic immediately; completion is separate so a
+        # failed shutdown can be retried instead of silently returning early.
+        with self._close_lock:
+            if self._close_complete:
                 return
-            self.closed = True
-            for sock in self._sockets:
+            with self._lock:
+                self.closed = True
+                sockets = list(self._sockets)
+            errors = []
+            for sock in sockets:
                 try:
                     sock.shutdown(socket.SHUT_RDWR)
                 except OSError:
                     pass
-                sock.close()
-            self._sockets.clear()
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=2)
+                try:
+                    sock.close()
+                except Exception as exc:
+                    errors.append(exc)
+                else:
+                    self.untrack(sock)
+            for operation in (self.server.shutdown, self.server.server_close):
+                try:
+                    operation()
+                except Exception as exc:
+                    errors.append(exc)
+            self.thread.join(timeout=2)
+            if self.thread.is_alive():
+                errors.append(RuntimeError("Proxy relay thread has not stopped"))
+            if errors:
+                raise RuntimeError("Proxy relay cleanup incomplete; retry required") from None
+            self._close_complete = True

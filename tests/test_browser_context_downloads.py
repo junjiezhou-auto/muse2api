@@ -70,7 +70,7 @@ with tempfile.TemporaryDirectory(prefix="muse-download-fixture-") as home:
             assert not directory.exists(), "context download directory leaked"
 
     with patch.object(mod, "CDP", Page), patch.object(
-            mod, "time", SimpleNamespace(time=time.time, sleep=lambda _: None)):
+            mod, "time", SimpleNamespace(time=time.time, monotonic=time.monotonic, sleep=lambda _: None)):
         with ThreadPoolExecutor(max_workers=2) as pool:
             result = list(pool.map(download, range(2)))
     assert result[0][0] != result[1][0], result

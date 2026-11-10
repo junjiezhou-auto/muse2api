@@ -54,7 +54,8 @@ from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
                     REFERENCE_MIME_EXT, MuseAuthError, MuseEngine, MuseGenerationError,
                     MuseModelRefusalError, RefImageSafetyError, reference_kind)
 from engine import MuseProxyError
-from store import Store, account_expiry, min_expiry
+from runtime import QueueFullError, StreamBridge, WorkerPool
+from store import TaskCapacityError, Store, account_expiry, min_expiry
 from proxy import normalize_server, request_proxy_context, split_proxy_url
 
 import sys
@@ -139,10 +140,13 @@ class AccountPoolManager:
 
     def acquire(self, account_id: str | None = None, preferred_id: str | None = None,
                 rotate: bool = True, force_rotate: bool = False,
-                timeout: float = 60.0, record_use: bool = True) -> dict:
+                timeout: float = 60.0, record_use: bool = True,
+                stop_event: threading.Event | None = None) -> dict:
         deadline = time.monotonic() + timeout
         with self.cond:
             while True:
+                if stop_event is not None and stop_event.is_set():
+                    raise MuseGenerationError("请求已取消，停止等待空闲账号")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise MuseGenerationError("等待空闲账号超时，当前所有账号均处于繁忙中")
@@ -167,8 +171,7 @@ class AccountPoolManager:
                         self.busy_accounts.add(acc["id"])
                         return acc
 
-                live = [a for a in self.store.accounts if a.get("enabled", True) and a.get("cookies")]
-                if not live:
+                if not self.store.has_enabled_accounts_with_cookies():
                     raise MuseAuthError("没有可用账号，请先在管理页面导入 cookie")
 
                 self.cond.wait(timeout=min(remaining, 0.5))
@@ -184,6 +187,9 @@ class AccountPoolManager:
 GEN_LOCK = ConcurrencyLock(limit=CFG.max_concurrency)
 ACCOUNT_POOL = AccountPoolManager(store)
 IMAGE_TASK_LOCK = threading.Lock()
+# Bounded generation workers: browser work never occupies asyncio's default
+# executor nor AnyIO's HTTP thread pool, and queued requests are capped.
+GEN_POOL = WorkerPool(CFG.max_concurrency, CFG.max_pending, name="muse-generation")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -366,107 +372,152 @@ def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -
     return store.get_account(acc_id)
 
 
-def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
-                     timeout: int, account_id: str | None):
-    """在独立线程中执行 chat_stream 并持有 GEN_LOCK，通过 Queue 往外吐。
-    无论下游客户端何时断连、异常或超时，stop_event + finally 块保证 100% 立即释放 GEN_LOCK，绝不死锁。
-    若首字前遇到单账号 VM 卡死或会话异常，自动切换下一个健康账号重试一次。"""
-    import queue
-    q = queue.Queue(maxsize=100)
+def _close_attempt_page():
+    """Retire browser resources before handing a leased account to another worker."""
+    try:
+        engine.close_current_page()
+    except Exception as exc:
+        # Engine owns retry bookkeeping; cleanup must not strand a lease or slot.
+        log.warning("页面清理异常，继续释放调度资源 (%s)", type(exc).__name__)
+    finally:
+        _clear_account_proxy()
+
+
+def _retry_error(exc: Exception) -> Exception:
+    """Keep public error type/message, never the failed attempt's traceback graph."""
+    for cls in (MuseAuthError, MuseProxyError, MuseModelRefusalError, RefImageSafetyError, MuseGenerationError):
+        if isinstance(exc, cls):
+            return cls(str(exc))
+    return MuseGenerationError(f"生成失败: {exc}")
+
+
+def _chat_stream_core(prompt: str, timeout: int, account_id: str | None,
+                      emit, stop_event: threading.Event):
+    """统一的聊天执行核心：先取浏览器槽位（GEN_LOCK），再租借账号。
+
+    与生图/生视频保持相同的锁获取顺序，消除「chat 先占账号、媒体先占槽位」
+    的死锁环。emit(chunk) 返回 False 表示消费端已断开，应立即停止并释放；
+    stop_event 贯穿 engine.chat_stream 以支持流式取消。
+    失败时抛 MuseAuthError / MuseGenerationError。
+    """
+    if not GEN_LOCK.acquire(timeout=max(1, timeout)):
+        raise MuseGenerationError("等待浏览器队列超时，请稍后重试")
+    leased_id: str | None = None
+    cur_id = account_id
+    last_exc: Exception | None = None
+    try:
+        for attempt in range(2):
+            if stop_event.is_set():
+                return
+            if attempt > 0:
+                if leased_id:
+                    ACCOUNT_POOL.release(leased_id)
+                    leased_id = None
+                try:
+                    alt = ACCOUNT_POOL.acquire(rotate=True, force_rotate=True, timeout=timeout,
+                                               stop_event=stop_event)
+                except Exception:
+                    break
+                if not alt or alt["id"] == cur_id:
+                    if alt:
+                        leased_id = alt["id"]
+                    break
+                cur_id = alt["id"]
+                leased_id = cur_id
+                acc = alt
+                log.info("【对话自动切号】切换到备用账号 %s (%s) 重试...", acc.get("label"), cur_id)
+            else:
+                acc = ACCOUNT_POOL.acquire(account_id=cur_id,
+                                           preferred_id=getattr(engine, "current_acc_id", None),
+                                           timeout=timeout, stop_event=stop_event)
+                cur_id = acc["id"]
+                leased_id = cur_id
+            if stop_event.is_set():
+                return
+            yielded = False
+            try:
+                _bind_account_proxy(store.get_account(cur_id) or {})
+                refreshed = _renew_and_persist(cur_id, wake_vm=True, force=(attempt > 0))
+                if refreshed:
+                    acc = refreshed
+                engine.start()
+                for chunk in engine.chat_stream(
+                        acc["cookies"], prompt, acc.get("cookies_exp"), timeout,
+                        account_id=cur_id, stop_event=stop_event):
+                    yielded = True
+                    if emit(chunk) is False:
+                        return
+                store.mark(cur_id, True, "")
+                _sync_cookies(cur_id)
+                return
+            except MuseAuthError as exc:
+                last_exc = _retry_error(exc)
+                store.mark(cur_id, False, str(exc))
+                if yielded:
+                    break
+            except MuseProxyError as exc:
+                last_exc = _retry_error(exc)
+                store.touch_keepalive(cur_id, None, f"代理异常: {str(exc)[:160]}")
+            except Exception as exc:  # noqa: BLE001
+                last_exc = _retry_error(exc)
+                if yielded:
+                    break
+            finally:
+                # Do this inside each attempt, before releasing/reacquiring a lease.
+                _close_attempt_page()
+        if last_exc is not None:
+            raise last_exc
+    finally:
+        try:
+            _close_attempt_page()
+        finally:
+            try:
+                if leased_id:
+                    ACCOUNT_POOL.release(leased_id)
+            finally:
+                GEN_LOCK.release()
+
+
+def _run_chat_text(prompt: str, timeout: int, account_id: str | None = None) -> str:
+    """同步收集一次聊天的完整回复（在工作池线程中执行）。"""
+    chunks: list[str] = []
     stop_event = threading.Event()
 
-    def worker():
-        cur_id = account_id
-        cur_cookies = cookies
-        cur_exp = expires
-        last_exc = None
-        leased_id = None
+    def emit(chunk: str) -> bool:
+        chunks.append(chunk)
+        return not stop_event.is_set()
+
+    _chat_stream_core(prompt, timeout, account_id, emit, stop_event)
+    return "".join(chunks)
+
+
+def _submit_chat_stream(prompt: str, timeout: int) -> StreamBridge:
+    """提交流式聊天到生成工作池，返回异步可消费的桥接对象。"""
+    bridge = StreamBridge(max_items=64)
+
+    def runner():
         try:
-            for attempt in range(2):
-                if stop_event.is_set():
-                    return
-                if attempt > 0:
-                    if leased_id:
-                        ACCOUNT_POOL.release(leased_id)
-                        leased_id = None
-                    try:
-                        alt = ACCOUNT_POOL.acquire(rotate=True, force_rotate=True, timeout=timeout)
-                    except Exception:
-                        break
-                    if not alt or alt["id"] == cur_id:
-                        if alt:
-                            leased_id = alt["id"]
-                        break
-                    cur_id = alt["id"]
-                    leased_id = cur_id
-                    cur_cookies = alt["cookies"]
-                    cur_exp = alt.get("cookies_exp")
-                    log.info("【对话自动切号】切换到备用账号 %s (%s) 重试...", alt.get("label"), cur_id)
-                elif cur_id:
-                    ACCOUNT_POOL.acquire(account_id=cur_id, timeout=timeout)
-                    leased_id = cur_id
-
-                yielded = False
-                try:
-                    if cur_id:
-                        _bind_account_proxy(store.get_account(cur_id) or {})
-                        refreshed = _renew_and_persist(cur_id, wake_vm=True, force=(attempt > 0))
-                        if refreshed:
-                            cur_cookies = refreshed["cookies"]
-                            cur_exp = refreshed.get("cookies_exp")
-                    with GEN_LOCK:
-                        if stop_event.is_set():
-                            return
-                        engine.start()
-                        for chunk in engine.chat_stream(
-                            cur_cookies, prompt, cur_exp, timeout,
-                            account_id=cur_id, stop_event=stop_event
-                        ):
-                            yielded = True
-                            q.put(("data", chunk))
-                            if stop_event.is_set():
-                                return
-                    if cur_id:
-                        store.mark(cur_id, True, "")
-                        _sync_cookies(cur_id)
-                    return
-                except MuseAuthError as exc:
-                    last_exc = exc
-                    if cur_id:
-                        store.mark(cur_id, False, str(exc))
-                    engine.close_current_page()
-                    if yielded:
-                        break
-                except Exception as exc:
-                    last_exc = exc
-                    try:
-                        engine.reset_thread()
-                    except Exception:
-                        pass
-                    if yielded:
-                        break
-            if last_exc is not None:
-                q.put(("error", last_exc))
-        finally:
-            if leased_id:
-                ACCOUNT_POOL.release(leased_id)
-            engine.close_current_page()
-            _clear_account_proxy()
-            q.put(("done", None))
-
-    threading.Thread(target=worker, daemon=True).start()
+            _chat_stream_core(prompt, timeout, None,
+                              lambda chunk: bridge.put(chunk), bridge.stop_event)
+        except BaseException as exc:  # noqa: BLE001
+            bridge.finish(exc)
+        else:
+            bridge.finish()
 
     try:
-        while True:
-            kind, val = q.get()
-            if kind == "data":
-                yield val
-            elif kind == "error":
-                raise val
-            else:
-                break
-    finally:
-        stop_event.set()
+        bridge.future = GEN_POOL.submit(runner)
+    except QueueFullError:
+        bridge.cancel()
+        raise
+    return bridge
+
+
+async def _run_pool_async(fn, *args, **kwargs):
+    """在工作池中执行同步生成逻辑；队列饱和时统一返回 429。"""
+    try:
+        return await GEN_POOL.run(fn, *args, **kwargs)
+    except QueueFullError as exc:
+        raise HTTPException(429, "生成队列已满，请稍后重试") from exc
 
 
 class ImageRequest(BaseModel):
@@ -1122,14 +1173,7 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
     preferred_id = getattr(engine, "current_acc_id", None)
     if kind == "video" and not account_id:
         # Prefer the last account that completed a video; session health alone is insufficient.
-        recent = sorted(list(store.tasks.values()), key=lambda task: task.get("created_at", 0), reverse=True)
-        for task in recent:
-            if task.get("kind") != "video" or task.get("status") != "completed" or not task.get("account"):
-                continue
-            candidate = store.get_account(task["account"])
-            if candidate and candidate.get("enabled", True) and candidate.get("ok") is not False:
-                preferred_id = candidate["id"]
-                break
+        preferred_id = store.latest_completed_account_id(kind="video") or preferred_id
     acc = ACCOUNT_POOL.acquire(account_id=account_id,
                                preferred_id=preferred_id,
                                timeout=max(1, remaining_wait))
@@ -1179,29 +1223,27 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                 _sync_cookies(cur_acc["id"])
                 return res, cur_acc["id"]
             except MuseAuthError as exc:
-                last_exc = exc
+                last_exc = _retry_error(exc)
                 store.mark(cur_acc["id"], False, str(exc))
-                engine.close_current_page()
             except MuseProxyError as exc:
-                last_exc = exc
+                last_exc = _retry_error(exc)
                 store.touch_keepalive(cur_acc["id"], None, f"代理异常: {str(exc)[:160]}")
-                engine.close_current_page()
             except MuseGenerationError as exc:
-                last_exc = exc
+                last_exc = _retry_error(exc)
                 store.mark(cur_acc["id"], True, f"任务异常: {str(exc)[:60]}")
-                try:
-                    engine.reset_thread()
-                except Exception:
-                    pass
             except Exception as exc:  # noqa: BLE001
-                engine.close_current_page()
-                last_exc = MuseGenerationError(f"生成失败: {exc}")
+                last_exc = _retry_error(exc)
+            finally:
+                # Release failed page/context and proxy snapshot before a retry
+                # waits for another account. Retain only detached error metadata.
+                _close_attempt_page()
         raise last_exc
     finally:
-        if cur_acc:
-            ACCOUNT_POOL.release(cur_acc.get("id"))
-        engine.close_current_page()
-        _clear_account_proxy()
+        try:
+            _close_attempt_page()
+        finally:
+            if cur_acc:
+                ACCOUNT_POOL.release(cur_acc.get("id"))
 
 
 # ------------------------- 基础接口 -------------------------
@@ -1285,7 +1327,10 @@ def _queue_image(req: ImageRequest, prompt: str, reference_images: list[str],
         if sum(t.get("kind") == "image" and t.get("status") in ("queued", "processing")
                for t in tasks) >= 8:
             raise HTTPException(429, "Image queue is full; retry later")
-        task = store.create_task("image", req.prompt)
+        try:
+            task = store.create_task("image", req.prompt)
+        except TaskCapacityError as exc:
+            raise HTTPException(429, "任务状态已满，请稍后重试") from exc
         tid = task["id"]
         store.update_task(tid, api_prompt=prompt, size=req.size,
                           response_format=req.response_format, progress=0,
@@ -1312,7 +1357,11 @@ def _queue_image(req: ImageRequest, prompt: str, reference_images: list[str],
             store.update_task(tid, status="failed", error=str(exc),
                               elapsed=round(time.time() - timing["t0"], 1))
 
-    threading.Thread(target=worker, daemon=True).start()
+    try:
+        GEN_POOL.submit(worker)
+    except QueueFullError as exc:
+        store.update_task(tid, status="failed", error="生成队列已满，请稍后重试")
+        raise HTTPException(429, "生成队列已满，请稍后重试") from exc
     return JSONResponse(status_code=202, content={
         "id": tid, "task_id": tid, "object": "image.task", "status": "queued",
         "progress": 0, "created_at": task["created_at"]})
@@ -1348,7 +1397,7 @@ async def images_generations(req: ImageRequest, _=Depends(auth)):
     if req.async_:
         return _queue_image(req, prompt, ref_images)
     try:
-        res, _acc = await asyncio.to_thread(
+        res, _acc = await _run_pool_async(
             _run_generation, prompt, "image", timeout, reference_images=ref_images)
     except MuseAuthError as exc:
         raise HTTPException(401, str(exc)) from exc
@@ -1446,7 +1495,7 @@ async def images_edits(request: Request, _=Depends(auth)):
     if req_obj.async_:
         return _queue_image(req_obj, full_prompt, ref_image_data)
     try:
-        res, _acc = await asyncio.to_thread(
+        res, _acc = await _run_pool_async(
             _run_generation, full_prompt, "image", gen_timeout,
             reference_images=ref_image_data)
     except MuseAuthError as exc:
@@ -1466,23 +1515,25 @@ async def create_video(req: VideoRequest, _=Depends(auth)):
 
     prompt = build_video_prompt(req, _reference_kinds(ref_images))
     timeout = req.timeout or CFG.video_timeout
-    task = store.create_task("video", req.prompt)
-    store.update_task(task["id"], api_prompt=prompt)
-
-    store.update_task(task["id"], progress=10)
+    try:
+        task = store.create_task("video", req.prompt)
+    except TaskCapacityError as exc:
+        raise HTTPException(429, "任务状态已满，请稍后重试") from exc
+    tid = task["id"]
+    store.update_task(tid, api_prompt=prompt, progress=10)
 
     def worker():
         timing = {"t0": time.time()}
         def _on_acquired():
             timing["t0"] = time.time()
-            store.update_task(task["id"], status="processing", progress=15)
+            store.update_task(tid, status="processing", progress=15)
         try:
             def prog_cb(p):
-                store.update_task(task["id"], progress=p)
+                store.update_task(tid, progress=p)
             res, acc_id = _run_generation(prompt, "video", timeout, on_progress=prog_cb,
                                           reference_images=ref_images, on_acquired=_on_acquired)
             vurl = media_url(res["filename"])
-            store.update_task(task["id"], status="completed", progress=100, account=acc_id,
+            store.update_task(tid, status="completed", progress=100, account=acc_id,
                               elapsed=round(time.time() - timing["t0"], 1),
                               url=vurl,
                               video={"url": vurl},
@@ -1490,11 +1541,15 @@ async def create_video(req: VideoRequest, _=Depends(auth)):
                                       "filename": res["filename"],
                                       "bytes": res["size"], "kind": res["kind"]})
         except Exception as exc:  # noqa: BLE001
-            store.update_task(task["id"], status="failed",
+            store.update_task(tid, status="failed",
                               elapsed=round(time.time() - timing["t0"], 1), error=str(exc))
 
-    threading.Thread(target=worker, daemon=True).start()
-    return {"id": task["id"], "task_id": task["id"], "object": "video.task", "status": "queued",
+    try:
+        GEN_POOL.submit(worker)
+    except QueueFullError as exc:
+        store.update_task(tid, status="failed", error="生成队列已满，请稍后重试")
+        raise HTTPException(429, "生成队列已满，请稍后重试") from exc
+    return {"id": tid, "task_id": tid, "object": "video.task", "status": "queued",
             "progress": 10, "created_at": task["created_at"]}
 
 
@@ -1544,20 +1599,23 @@ def _want_usage(stream_options) -> bool:
     return False
 
 
-def _pace_text(text: str, chunk_size: int = 2, delay: float = 0.012):
-    """把大块文本平滑切分为仿原生 LLM 打字机的微流式 Token。
-    若传入文本本身微小（<= 3 字），直接秒级放行，零延迟；
-    若传入文本是大块（如 DOM 批量刷新），按每 chunk_size 字间隔 delay 平滑输出。
+_SSE_PACE = 0.012
+
+
+def _pace_text(text: str, chunk_size: int = 2):
+    """把大块文本切分为仿原生 LLM 打字机的微流式 Token（仅切分，不睡眠）。
+
+    节流由异步调用方通过 await asyncio.sleep(_SSE_PACE) 完成：
+    旧实现每 2 字 time.sleep(12ms) 会累计阻塞事件循环数百毫秒，
+    并发流式时会拖慢所有 HTTP 请求。
     """
     if not text:
         return
-    if len(text) <= 3 or delay <= 0:
+    if len(text) <= 3:
         yield text
         return
     for i in range(0, len(text), chunk_size):
         yield text[i:i + chunk_size]
-        if i + chunk_size < len(text):
-            time.sleep(delay)
 
 
 _SSE_HEADERS = {
@@ -1594,15 +1652,9 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
 
     model = resolve_model(req.model, default="muse-spark")
     timeout = int(req.timeout or CFG.chat_timeout)
-    acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
-    if not acc:
-        raise HTTPException(400, "没有可用账号，请先在管理页面导入 cookie")
 
     cid = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
-    acc_id = acc["id"]
-    cookies = acc["cookies"]
-    expires = acc.get("cookies_exp")
 
     def tool_call_deltas(calls: list[dict]) -> list[list[dict]]:
         """按 OpenAI 习惯分两片发：先 id/name，再 arguments 全文。"""
@@ -1614,23 +1666,32 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
         return [head, body]
 
     if req.stream:
-        def sync_stream():
+        # 账号选择移入工作线程；此处不再占用事件循环等存储锁。
+        try:
+            bridge = _submit_chat_stream(prompt, timeout)
+        except QueueFullError as exc:
+            raise HTTPException(429, "生成队列已满，请稍后重试") from exc
+
+        async def event_stream():
+            # 异步消费：SSE 不再占用 AnyIO/默认执行器线程，
+            # 客户端断开时 finally 取消 worker 并释放账号与浏览器槽位。
             try:
                 # 握手建立瞬间立即发送 role: assistant 首包，让下游客户端秒级捕获光标
                 yield _sse(_chat_chunk(cid, created, model, {"role": "assistant"}))
 
-                stream_gen = safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id)
                 if not tool_note:
-                    for chunk in stream_gen:
+                    async for chunk in bridge:
                         for piece in _pace_text(chunk):
                             yield _sse(_chat_chunk(cid, created, model, {"content": piece}))
+                            await asyncio.sleep(_SSE_PACE)
                     yield _sse(_chat_chunk(cid, created, model, {}, finish="stop"))
                 else:
                     buf, mode = "", None
-                    for chunk in stream_gen:
+                    async for chunk in bridge:
                         if mode == "text":
                             for piece in _pace_text(chunk):
                                 yield _sse(_chat_chunk(cid, created, model, {"content": piece}))
+                                await asyncio.sleep(_SSE_PACE)
                             continue
                         buf += chunk
                         if mode is None:
@@ -1642,6 +1703,7 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
                                     mode = "text"
                                     for piece in _pace_text(buf):
                                         yield _sse(_chat_chunk(cid, created, model, {"content": piece}))
+                                        await asyncio.sleep(_SSE_PACE)
                                     buf = ""
                     if mode == "text":
                         yield _sse(_chat_chunk(cid, created, model, {}, finish="stop"))
@@ -1651,6 +1713,7 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
                             if rest:
                                 for piece in _pace_text(rest):
                                     yield _sse(_chat_chunk(cid, created, model, {"content": piece}))
+                                    await asyncio.sleep(_SSE_PACE)
                             for piece in tool_call_deltas(calls):
                                 yield _sse(_chat_chunk(cid, created, model, {"tool_calls": piece}))
                             yield _sse(_chat_chunk(cid, created, model, {}, finish="tool_calls"))
@@ -1658,6 +1721,7 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
                             if buf:
                                 for piece in _pace_text(buf):
                                     yield _sse(_chat_chunk(cid, created, model, {"content": piece}))
+                                    await asyncio.sleep(_SSE_PACE)
                             yield _sse(_chat_chunk(cid, created, model, {}, finish="stop"))
                 if _want_usage(req.stream_options):
                     yield _sse({"id": cid, "object": "chat.completion.chunk",
@@ -1665,26 +1729,18 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
                                 "choices": [],
                                 "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}})
                 yield "data: [DONE]\n\n"
-                store.mark(acc_id, True, "")
             except MuseAuthError as exc:
-                store.mark(acc_id, False, str(exc))
                 yield _sse({"error": {"message": str(exc), "type": "auth_error", "code": 401}})
             except MuseGenerationError as exc:
-                store.mark(acc_id, True, f"助手超时: {str(exc)[:60]}")
-                try:
-                    engine.reset_thread()
-                except Exception:
-                    pass
                 yield _sse({"error": {"message": str(exc), "type": "server_error", "code": 502}})
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 yield _sse({"error": {"message": f"内部错误: {exc}", "type": "server_error", "code": 500}})
-        return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
-
-    def run() -> str:
-        return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id))
+            finally:
+                bridge.cancel()
+        return StreamingResponse(event_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
     try:
-        text = await asyncio.to_thread(run)
+        text = await _run_pool_async(_run_chat_text, prompt, timeout)
     except MuseAuthError as exc:
         raise HTTPException(401, str(exc))
     except MuseGenerationError as exc:
@@ -1756,14 +1812,10 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
 
     model = resolve_model(req.model, default="muse-spark")
     timeout = int(req.timeout or CFG.chat_timeout)
-    acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
-    if not acc:
-        raise HTTPException(400, "没有可用账号，请先在管理页面导入 cookie")
 
     rid = "resp_" + uuid.uuid4().hex[:24]
     mid = "msg_" + uuid.uuid4().hex[:24]
     created = int(time.time())
-    acc_id, cookies, expires = acc["id"], acc["cookies"], acc.get("cookies_exp")
 
     def envelope(status: str, text: str = "") -> dict:
         done = status == "completed"
@@ -1777,7 +1829,12 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
                           "total_tokens": 0}}
 
     if req.stream:
-        def sync_stream():
+        try:
+            bridge = _submit_chat_stream(prompt, timeout)
+        except QueueFullError as exc:
+            raise HTTPException(429, "生成队列已满，请稍后重试") from exc
+
+        async def event_stream():
             try:
                 yield _sse_event("response.created", {
                     "type": "response.created",
@@ -1792,7 +1849,7 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
                     "part": {"type": "output_text", "text": "",
                              "annotations": []}})
                 full = ""
-                for chunk in safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id):
+                async for chunk in bridge:
                     full += chunk
                     yield _sse_event("response.output_text.delta", {
                         "type": "response.output_text.delta", "item_id": mid,
@@ -1814,13 +1871,12 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
                 yield _sse_event("response.failed", {
                     "type": "response.failed",
                     "response": envelope("failed")})
-        return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
-
-    def run() -> str:
-        return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id))
+            finally:
+                bridge.cancel()
+        return StreamingResponse(event_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
     try:
-        text = await asyncio.to_thread(run)
+        text = await _run_pool_async(_run_chat_text, prompt, timeout)
     except MuseAuthError as exc:
         raise HTTPException(401, str(exc))
     except MuseGenerationError as exc:
@@ -1846,6 +1902,7 @@ def admin_status(_=Depends(auth)):
     return {
         "accounts": store.list_accounts(),
         "stats": store.stats(),
+        "queue": GEN_POOL.snapshot(),
         "tasks": store.list_tasks(20),
         "media_count": len(os.listdir(CFG.media_dir))
         if os.path.isdir(CFG.media_dir) else 0,
@@ -2467,11 +2524,14 @@ def _warmup_browser_sync():
         log.warning("【浏览器预热】预热异常: %s", exc)
     finally:
         # Warmup runs in a worker thread; do not retain its account reservation or page.
-        engine.close_current_page()
-        _clear_account_proxy()
-        if acc:
-            ACCOUNT_POOL.release(acc["id"])
-        GEN_LOCK.release()
+        try:
+            _close_attempt_page()
+        finally:
+            try:
+                if acc:
+                    ACCOUNT_POOL.release(acc["id"])
+            finally:
+                GEN_LOCK.release()
 
 
 async def _keepalive_loop():
@@ -2838,7 +2898,9 @@ async def admin_repo_push(payload: dict = Body(default={}), _=Depends(auth)):
 
 @app.on_event("startup")
 async def _startup():
-    for task in list(store.tasks.values()):
+    # 任务状态只存内存：冷启动天然为空；进程内重载（如 uvicorn reload）时，
+    # 仍需把遗留的 queued/processing 任务标记为失败，避免查询端永远等待。
+    for task in store.tasks.values():
         if task.get("kind") in ("image", "video") and task.get("status") in ("queued", "processing"):
             store.update_task(task["id"], status="failed", error="服务重启中断了任务，请重新提交")
     if not CFG.api_key:
@@ -2852,4 +2914,10 @@ async def _startup():
 
 @app.on_event("shutdown")
 def _shutdown():
+    # 顺序：先停止接收新生成并等待在途 worker 退出，再可靠落盘账号，最后关浏览器。
+    GEN_POOL.shutdown(timeout=10)
+    try:
+        store.close(timeout=10)
+    except Exception as exc:  # noqa: BLE001
+        log.error("关闭时账号状态落盘失败: %s", exc)
     engine.stop()

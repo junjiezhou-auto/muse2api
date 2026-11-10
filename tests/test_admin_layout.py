@@ -48,19 +48,26 @@ with tempfile.TemporaryDirectory(prefix='muse-layout-',dir=Path.home()) as home:
    except (requests.RequestException,StopIteration):time.sleep(.1)
   assert page
   page.send('Page.enable');page.send('Runtime.enable')
-  page.send('Page.addScriptToEvaluateOnNewDocument',{'source':"localStorage.setItem('muse2api_lang',localStorage.getItem('muse2api_lang')||'zh');window.__errors=[];window.addEventListener('error',e=>__errors.push(e.message));"})
-  page.send('Page.navigate',{'url':f'http://127.0.0.1:{server.server_port}/?key=fixture-only'})
+  page.send('Page.addScriptToEvaluateOnNewDocument',{'source':"window.__errors=[];window.addEventListener('error',e=>__errors.push(e.message));"})
+  page.send('Page.navigate',{'url':f'http://127.0.0.1:{server.server_port}/'})
   def wait(expr):
    end=time.monotonic()+15
    while time.monotonic()<end:
     if page.js(expr):return
     time.sleep(.1)
    raise AssertionError('Condition failed: '+expr)
-  wait("document.querySelectorAll('#poolBody tr').length===8")
+  # The test page keeps no state in the browser: the key is typed in-page and
+  # the pool tab loads accounts only on explicit selection.
+  def open_pool(lang):
+   wait("document.readyState==='complete'&&typeof goTab==='function'&&typeof saveKey==='function'")
+   page.js(f"setLang({lang!r});document.getElementById('key').value='fixture-only';saveKey();goTab('pool');")
+   wait("document.querySelectorAll('#poolBody tr').length===8")
+   page.js(f"setLang({lang!r});")  # translate rows rendered after the switch
+  open_pool('zh')
   measure="""(()=>{const m=document.querySelector('main'),w=document.querySelector('#poolBody').closest('.tblwrap'),n=document.querySelector('#poolBody td.ellip');return {viewport:innerWidth,mainWidth:m.getBoundingClientRect().width,bodyWidth:document.documentElement.scrollWidth,tableWidth:w.clientWidth,tableScroll:w.scrollWidth,noteDisplay:getComputedStyle(n).display,noteWhiteSpace:getComputedStyle(n).whiteSpace,buttons:document.querySelectorAll('#poolBody tr:first-child button').length}})()"""
   for lang in (['zh'] if args.probe_only else ['zh','en']):
    if lang=='en':
-    page.js("localStorage.setItem('muse2api_lang','en');location.reload()");wait("document.querySelectorAll('#poolBody tr').length===8")
+    open_pool('en')
    for width in ([1920] if args.probe_only else [2560,1920,1536,1440,1366,1280,768,390,320]):
     page.send('Emulation.setDeviceMetricsOverride',{'width':width,'height':1080,'deviceScaleFactor':1,'mobile':False})
     time.sleep(.15);m=page.js(measure);print(json.dumps({'lang':lang,**m}),flush=True)

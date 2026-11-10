@@ -21,18 +21,20 @@ PROXY = {"server": "http://proxy.example:8080", "username": "fixture",
          "password": "secret-marker"}
 acc = app.store.add_account({"hatch_sess": "cookie-marker", "hatch_vml": "fixture"})
 aid = acc["id"]
-acc["ok"] = True
+# Store snapshots are deep copies now; seed state and verify via fresh reads.
+app.store.update_account_runtime(aid, ok=True)
 patch_req = app.AccountPatch(proxy=app.AccountProxy(**PROXY))
 public = app.patch_account(aid, patch_req)
 assert public["proxy"]["has_password"] is True
 assert "secret-marker" not in json.dumps(public)
-assert acc["ok"] is None
-assert acc["cookies"]["hatch_sess"] == "cookie-marker"
+current = app.store.get_account(aid)
+assert current["ok"] is None, "proxy edit must reset account health state"
+assert current["cookies"]["hatch_sess"] == "cookie-marker"
 
-before_use = (acc["last_used"], acc["use_count"])
+before_use = (current["last_used"], current["use_count"])
 with app._account_operation(aid) as snapshot:
     assert app._account_proxy(snapshot) == PROXY
-    assert snapshot is not acc
+    assert snapshot is not current
     try:
         app.patch_account(aid, app.AccountPatch(proxy=None))
     except app.HTTPException as exc:
@@ -41,14 +43,16 @@ with app._account_operation(aid) as snapshot:
         raise AssertionError("busy proxy edit must be rejected")
     result = app._probe_account_sync(aid)
     assert result["ok"] is False and result["busy"] is True
-    acc["proxy"] = {"server": "http://changed.example:80"}
+    app.store.update_account_runtime(aid, proxy={"server": "http://changed.example:80"})
     assert app._account_proxy(snapshot) == PROXY
-acc["proxy"] = copy.deepcopy(PROXY)
+app.store.update_account(aid, proxy=copy.deepcopy(PROXY))
 assert aid not in app.ACCOUNT_POOL.busy_accounts
 assert not hasattr(app.engine._ensure_local(), "proxy_snapshot")
-assert (acc["last_used"], acc["use_count"]) == before_use
+current = app.store.get_account(aid)
+assert (current["last_used"], current["use_count"]) == before_use
 
-protected = {k: copy.deepcopy(acc.get(k)) for k in
+fresh = app.store.get_account(aid)
+protected = {k: copy.deepcopy(fresh.get(k)) for k in
              ("cookies", "cookies_exp", "ok", "expires_at", "last_keepalive", "synced_at")}
 seen = []
 def exit_request(session, url, **kwargs):
@@ -69,7 +73,7 @@ with patch("requests.Session.get", autospec=True, side_effect=exit_request), \
 assert result["ok"] and result["proxy_reachable"] and result["session_ok"]
 assert result["exit_ip"] == "203.0.113.42"
 assert "secret-marker" not in json.dumps(result)
-assert all(acc.get(k) == value for k, value in protected.items())
+assert all(app.store.get_account(aid).get(k) == value for k, value in protected.items())
 assert seen
 
 with patch("requests.Session.get", side_effect=requests.exceptions.ProxyError("secret-marker")), \
@@ -78,7 +82,7 @@ with patch("requests.Session.get", side_effect=requests.exceptions.ProxyError("s
 assert not result["ok"] and result["session_ok"] is None
 assert "secret-marker" not in json.dumps(result)
 renew_mock.assert_not_called()
-assert all(acc.get(k) == value for k, value in protected.items())
+assert all(app.store.get_account(aid).get(k) == value for k, value in protected.items())
 
 for error in (app.MuseAuthError("fixture 401"),
               app.MuseGenerationError("fixture workspace unavailable"),
@@ -87,12 +91,12 @@ for error in (app.MuseAuthError("fixture 401"),
          patch.object(app.engine, "renew_session_http", side_effect=error):
         failed = app.test_account_proxy(aid)
     assert failed["ok"] is False
-    assert all(acc.get(k) == value for k, value in protected.items())
+    assert all(app.store.get_account(aid).get(k) == value for k, value in protected.items())
     assert "secret-marker" not in json.dumps(failed)
 
-status_before = copy.deepcopy(acc.get("proxy_status"))
+status_before = copy.deepcopy(app.store.get_account(aid).get("proxy_status"))
 app.patch_account(aid, app.AccountPatch(proxy=app.AccountProxy(**PROXY)))
-assert acc.get("proxy_status") == status_before
+assert app.store.get_account(aid).get("proxy_status") == status_before
 
 # A cleanup error must never retain the account lease or proxy snapshot.
 with patch.object(app.engine, "close_current_page", side_effect=RuntimeError("fixture cleanup")):
@@ -115,10 +119,11 @@ with patch.object(app.engine, "start"), patch.object(app.engine, "quota", side_e
 assert aid not in app.ACCOUNT_POOL.busy_accounts
 assert not hasattr(app.engine._ensure_local(), "proxy_snapshot")
 
-assert (acc["last_used"], acc["use_count"]) == before_use
+current = app.store.get_account(aid)
+assert (current["last_used"], current["use_count"]) == before_use
 
 # A proxy outage must not mark unknown authentication as a successful account.
-acc["ok"] = None
+app.store.update_account_runtime(aid, ok=None)
 with patch.object(app, "_renew_and_persist", side_effect=app.MuseProxyError("fixture proxy unavailable")), \
      patch.object(app.engine, "generate") as generate:
     try:
@@ -129,7 +134,7 @@ with patch.object(app, "_renew_and_persist", side_effect=app.MuseProxyError("fix
     else:
         raise AssertionError("proxy failure was not propagated")
     generate.assert_not_called()
-assert acc["ok"] is None
+assert app.store.get_account(aid)["ok"] is None
 assert aid not in app.ACCOUNT_POOL.busy_accounts
 assert not hasattr(app.engine._ensure_local(), "proxy_snapshot")
 

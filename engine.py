@@ -303,9 +303,18 @@ class MuseEngine:
         self._local = threading.local()
         self._start_lock = threading.Lock()
         self._active_contexts: set[str] = set()
+        self._pending_disposals: set[str] = set()
+        self._cleanup_lock = threading.Lock()
+        self._disposal_cursor = 0
+        self._last_disposal_inventory = 0.0
         self._contexts_lock = threading.Lock()
         self._proxy_relays: set[HTTPProxyRelay] = set()
         self._download_dirs: set[str] = set()
+        self._download_roots: dict[str, str] = {}
+        # Only retired resources enter this ordered retry queue. Live workers'
+        # relays/directories must never be cleaned by another worker's retry.
+        self._pending_resource_cleanup: dict[tuple, object] = {}
+        self._resource_cleanup_inflight: set[tuple] = set()
         self.proxy_resolver = None
         self._last_http_renew: dict[str, float] = {}
         self._log = None
@@ -347,9 +356,17 @@ class MuseEngine:
         return f"http://127.0.0.1:{self.cfg.cdp_port}/json/version"
 
     def start(self):
+        # Lock the entire connect/spawn sequence, including externally owned Chrome.
         with self._start_lock:
-            if self.proc and self.proc.poll() is None and self.browser:
+            if (self.browser and not getattr(self.browser, "_closed", False)
+                    and (self.proc is None or self.proc.poll() is None)):
                 return
+            self._start_locked()
+
+    def _start_locked(self):
+        if self.browser:
+            self.browser.close()
+            self.browser = None
         env = dict(os.environ)
         env.setdefault("HOME", self.cfg.home_dir)
         env["PATH"] = (self.cfg.extra_path + os.pathsep + env.get("PATH", "")) if self.cfg.extra_path else env.get("PATH", "")
@@ -365,15 +382,18 @@ class MuseEngine:
             f"--user-data-dir={self.cfg.profile_dir}",
             "about:blank",
         ]
-        # 尝试复用已有健康 CDP
-        if not self.proc:
+        # Reconnect both external Chrome and an owned process with a lost socket.
+        if self.proc is None or self.proc.poll() is None:
             try:
-                v = http_json(self._debug_url(), timeout=1)
+                v = http_json(self._debug_url(), timeout=2)
                 if v and "webSocketDebuggerUrl" in v:
                     self.browser = CDP(v["webSocketDebuggerUrl"], timeout=180)
+                    self._last_disposal_inventory = 0.0
+                    self._retry_context_disposals()
                     return
             except Exception:
-                pass
+                if self.proc is not None and self.proc.poll() is None:
+                    raise MuseGenerationError("Chromium 正在运行但 CDP 不可连接，拒绝重复启动") from None
 
         # 清理残留锁
         for lock_name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
@@ -394,6 +414,8 @@ class MuseEngine:
             try:
                 v = http_json(self._debug_url(), timeout=2)
                 self.browser = CDP(v["webSocketDebuggerUrl"], timeout=180)
+                self._last_disposal_inventory = 0.0
+                self._retry_context_disposals()
                 return
             except Exception as exc:  # noqa: BLE001
                 last = exc
@@ -405,12 +427,21 @@ class MuseEngine:
             self._close_page()
             if self.browser:
                 with self._contexts_lock:
-                    for ctx_id in list(self._active_contexts):
-                        try:
-                            self.browser.send("Target.disposeBrowserContext", {"browserContextId": ctx_id})
-                        except Exception:
-                            pass
+                    self._pending_disposals.update(self._active_contexts)
                     self._active_contexts.clear()
+                    pending = list(self._pending_disposals)
+                deadline = time.monotonic() + 5.0
+                for ctx_id in pending:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        self.browser.send("Target.disposeBrowserContext",
+                                          {"browserContextId": ctx_id}, timeout=min(2, remaining))
+                    except Exception:
+                        continue
+                    with self._contexts_lock:
+                        self._pending_disposals.discard(ctx_id)
                 try:
                     self.browser.close()
                 except Exception:
@@ -422,17 +453,19 @@ class MuseEngine:
                     self.proc.wait(timeout=10)
                 except Exception:  # noqa: BLE001
                     self.proc.kill()
+                    self.proc.wait(timeout=5)
+            if self.proc is not None and self.proc.poll() is not None:
+                # Confirmed owned-browser death releases its contexts, unlike a
+                # lost CDP connection to an external still-running browser.
+                with self._contexts_lock:
+                    self._pending_disposals.clear()
             self.proc = None
             with self._contexts_lock:
-                relays = list(self._proxy_relays)
-                self._proxy_relays.clear()
-            for relay in relays:
-                relay.close()
-            with self._contexts_lock:
-                download_dirs = list(self._download_dirs)
-                self._download_dirs.clear()
-            for directory in download_dirs:
-                shutil.rmtree(directory, ignore_errors=True)
+                resources = [("relay", relay) for relay in self._proxy_relays]
+                resources += [("download", directory) for directory in self._download_dirs]
+                limit = len(resources) + len(self._pending_resource_cleanup)
+            # Failed resources stay owned, including when stop() is called again.
+            self._retry_resource_cleanup(resources, limit=limit)
 
     # ---------------- 页面 ----------------
     @property
@@ -440,49 +473,169 @@ class MuseEngine:
         return getattr(self._ensure_local(), "download_dir", None) or self.cfg.download_dir
 
     def _new_download_dir(self) -> str:
-        os.makedirs(self.cfg.download_dir, exist_ok=True)
-        directory = tempfile.mkdtemp(prefix="context-", dir=self.cfg.download_dir)
-        self._ensure_local().download_dir = directory
+        # Resolve only the trusted configured root, never a page-supplied path.
+        configured = os.fspath(self.cfg.download_dir)
+        if not configured:
+            raise ValueError("download_dir must name a configured directory")
+        root = os.path.realpath(os.path.abspath(configured))
+        if root == os.path.dirname(root):
+            raise ValueError("download_dir must not be the filesystem root")
+        os.makedirs(root, exist_ok=True)
+        directory = tempfile.mkdtemp(prefix="context-", dir=root)
         with self._contexts_lock:
             self._download_dirs.add(directory)
+            self._download_roots[directory] = root
+        self._ensure_local().download_dir = directory
         return directory
 
+    def _remove_download_dir(self, directory):
+        with self._contexts_lock:
+            root = self._download_roots.get(directory)
+        # Only mkdtemp-created immediate children of their original trusted root
+        # may be removed. Refuse root/child symlink replacement and foreign paths.
+        if (not root or os.path.dirname(directory) != root
+                or not os.path.basename(directory).startswith("context-")
+                or os.path.realpath(directory) != directory):
+            raise ValueError("refusing cleanup of an unowned download directory")
+        try:
+            shutil.rmtree(directory)
+        except FileNotFoundError:
+            # A missing child during rmtree is not proof the directory is gone.
+            try:
+                os.lstat(directory)
+            except FileNotFoundError:
+                return
+            raise
+
+    @staticmethod
+    def _resource_key(kind, resource):
+        return kind, resource if kind == "download" else id(resource)
+
+    def _retry_resource_cleanup(self, resources=(), limit=4):
+        """Clean newly retired resources plus a bounded fair batch of old ones."""
+        with self._contexts_lock:
+            preferred = []
+            for kind, resource in resources:
+                key = self._resource_key(kind, resource)
+                self._pending_resource_cleanup.setdefault(key, resource)
+                preferred.append(key)
+            old = [key for key in self._pending_resource_cleanup
+                   if key not in self._resource_cleanup_inflight and key not in preferred][:limit]
+            selected = list(dict.fromkeys(old + preferred))
+            claimed = []
+            for key in selected:
+                if key not in self._resource_cleanup_inflight:
+                    self._resource_cleanup_inflight.add(key)
+                    claimed.append((key, self._pending_resource_cleanup[key]))
+        # Claims, not a lock held over I/O, prevent concurrent double-close. The
+        # queue keeps ownership even while a cleanup attempt is in flight.
+        for key, resource in claimed:
+            succeeded = False
+            try:
+                if key[0] == "download":
+                    self._remove_download_dir(resource)
+                else:
+                    resource.close()
+                succeeded = True
+            except Exception as exc:
+                # No proxy credentials, arbitrary paths or exception text in logs.
+                log.warning("Deferred %s cleanup after %s", key[0], type(exc).__name__)
+            finally:
+                with self._contexts_lock:
+                    self._resource_cleanup_inflight.discard(key)
+                    self._pending_resource_cleanup.pop(key, None)
+                    if not succeeded:
+                        # Move failures to the tail so they cannot starve others.
+                        self._pending_resource_cleanup[key] = resource
+                    elif key[0] == "relay":
+                        self._proxy_relays.discard(resource)
+                    elif key[0] == "download":
+                        self._download_dirs.discard(resource)
+                        self._download_roots.pop(resource, None)
+
     def _close_page(self):
-        """关闭当前线程专属的页面并销毁隔离的 BrowserContext，彻底释放内存与 Session。"""
+        """Release thread-local state; independently retry each owned resource."""
+        local = self._ensure_local()
         p = self.page
         ctx_id = self.current_context_id
-        if p:
-            try:
-                p.close()
-            except Exception:
-                pass
-            self.page = None
-        if ctx_id and self.browser:
-            try:
-                self.browser.send("Target.disposeBrowserContext", {"browserContextId": ctx_id})
-            except Exception:
-                pass
+        relay = getattr(local, "proxy_relay", None)
+        directory = getattr(local, "download_dir", None)
+        # Detach the account before any fallible cleanup. Failed real resources
+        # are engine-owned retries, not state inherited by this worker's next job.
+        self.page = None
+        self.current_context_id = None
+        self.current_acc_id = None
+        local.proxy_relay = None
+        local.proxy_config = None
+        local.download_dir = None
+        if ctx_id:
             with self._contexts_lock:
                 self._active_contexts.discard(ctx_id)
-            self.current_context_id = None
-        self.current_acc_id = None
-        local = self._ensure_local()
-        relay = getattr(local, "proxy_relay", None)
-        if relay:
-            relay.close()
-            with self._contexts_lock:
-                self._proxy_relays.discard(relay)
-            local.proxy_relay = None
-        local.proxy_config = None
-        directory = getattr(local, "download_dir", None)
+                self._pending_disposals.add(ctx_id)
+        resources = []
+        if p is not None:
+            resources.append(("page", p))
+        if relay is not None:
+            resources.append(("relay", relay))
         if directory:
-            shutil.rmtree(directory, ignore_errors=True)
+            resources.append(("download", directory))
+        try:
+            # Attempt context teardown first; unavailable/busy cleanup may leave
+            # it pending, and must not prevent the independent resource attempts.
+            self._retry_context_disposals()
+        except Exception as exc:
+            log.warning("Deferred context cleanup after %s", type(exc).__name__)
+        finally:
+            # Context failures must not skip page, relay or directory cleanup.
+            self._retry_resource_cleanup(resources)
+
+    def _retry_context_disposals(self):
+        # Never hold the tracking lock across network I/O or serialize workers
+        # behind cleanup already in progress. Failed IDs remain owned for retry.
+        if not self.browser or not self._cleanup_lock.acquire(blocking=False):
+            return
+        try:
             with self._contexts_lock:
-                self._download_dirs.discard(directory)
-            local.download_dir = None
+                owned = set(self._pending_disposals)
+            # Only forget IDs after Chrome confirms absence; never evict live IDs.
+            now = time.monotonic()
+            if owned and now - getattr(self, "_last_disposal_inventory", 0.0) >= 30:
+                self._last_disposal_inventory = now
+                try:
+                    inventory = self.browser.send("Target.getBrowserContexts", timeout=2)
+                    ids = inventory.get("result", {}).get("browserContextIds")
+                    if isinstance(ids, list):
+                        with self._contexts_lock:
+                            self._pending_disposals.difference_update(owned - set(ids))
+                except Exception:
+                    pass  # Keep ownership when inventory is unavailable.
+            with self._contexts_lock:
+                owned = sorted(self._pending_disposals)
+                cursor = getattr(self, "_disposal_cursor", 0) % max(1, len(owned))
+                pending = (owned[cursor:] + owned[:cursor])[:4]
+                self._disposal_cursor = cursor + len(pending)
+            for ctx_id in pending:
+                try:
+                    self.browser.send("Target.disposeBrowserContext",
+                                      {"browserContextId": ctx_id}, timeout=2)
+                except Exception:
+                    continue
+                with self._contexts_lock:
+                    self._pending_disposals.discard(ctx_id)
+        finally:
+            self._cleanup_lock.release()
 
     def _open_page(self, proxy: dict | None = None):
         """Create an isolated account context; never fall back to shared cookies."""
+        self._retry_resource_cleanup()
+        self._retry_context_disposals()
+        with self._contexts_lock:
+            # Backpressure, not lossy eviction: in-flight workers may still close
+            # contexts, but sustained failures cannot admit unlimited new ones.
+            if len(self._pending_disposals) >= 64:
+                raise MuseGenerationError("浏览器上下文回收积压，暂停新建会话，请稍后重试")
+            if len(self._pending_resource_cleanup) >= 64:
+                raise MuseGenerationError("浏览器资源回收积压，暂停新建会话，请稍后重试")
         if not self.browser:
             error = MuseProxyError if proxy else MuseGenerationError
             raise error("浏览器未连接，无法创建独立账号会话；未回退共享标签页")
@@ -494,11 +647,12 @@ class MuseEngine:
                 with self._contexts_lock:
                     self._proxy_relays.add(relay)
                 res = self.browser.send("Target.createBrowserContext", {
+                    "disposeOnDetach": True,
                     "proxyServer": relay.url,
                     "proxyBypassList": "<-loopback>",
                 })
             else:
-                res = self.browser.send("Target.createBrowserContext")
+                res = self.browser.send("Target.createBrowserContext", {"disposeOnDetach": True})
             ctx_id = res.get("result", {}).get("browserContextId")
             if not ctx_id:
                 raise MuseGenerationError("Chromium 未返回独立上下文 ID")
@@ -522,11 +676,9 @@ class MuseEngine:
             })
             return page
         except Exception:
-            if page:
-                try:
-                    page.close()
-                except Exception:
-                    pass
+            if page is not None:
+                # Even partially initialized page sockets need retry ownership.
+                self.page = page
             self._close_page()
             error = MuseProxyError if proxy else MuseGenerationError
             raise error("无法创建该账号的独立浏览器会话；未回退共享标签页或直连") from None
@@ -1384,21 +1536,39 @@ class MuseEngine:
         "return String(n);})()"
     )
     _POLL_CHAT_JS = (
+        # 旧实现每次轮询都对 document.querySelectorAll('*') 逐元素取 computedStyle，
+        # 长会话 + 60ms 采样会把 Chromium 拖满核。这里缓存滚动容器与查询作用域
+        # （断连即失效、2 秒兜底重扫），气泡非空判断用不触发排版的 textContent，
+        # 仅对最后一个非空气泡取一次 innerText。返回结构与旧版完全一致。
         "(function(){"
-        "var els=[...document.querySelectorAll('*')].filter(function(e){"
-        "var s=getComputedStyle(e);"
-        "return (s.overflowY==='auto'||s.overflowY==='scroll')&&e.scrollHeight>e.clientHeight+100;});"
-        "els.sort(function(a,b){return b.scrollHeight-a.scrollHeight;});"
-        "if(els[0])els[0].scrollTop=els[0].scrollHeight;"
-        "var scope=document.querySelector('main,[class*=\"chat-scroll\"],[class*=\"hatch-chat-scroll\"]')||document.body;"
-        "var bs=[].slice.call(scope.querySelectorAll('div[class*=\"hatch-chat-groupable-bubble\"]'))"
+        "var w=window,now=Date.now();"
+        "var el=w.__m2aScroll;"
+        "if(!el||!el.isConnected||now-(w.__m2aScrollAt||0)>2000){"
+        "var cand=[].slice.call(document.querySelectorAll('main,section,div'));"
+        "var best=null;"
+        "for(var i=0;i<cand.length;i++){var e=cand[i],s=getComputedStyle(e);"
+        "if((s.overflowY==='auto'||s.overflowY==='scroll')&&e.scrollHeight>e.clientHeight+100){"
+        "if(!best||e.scrollHeight>best.scrollHeight)best=e;}}"
+        "el=best;w.__m2aScroll=el;w.__m2aScrollAt=now;}"
+        "if(el)el.scrollTop=el.scrollHeight;"
+        "var sc=w.__m2aScope;"
+        "if(!sc||!sc.isConnected){"
+        "sc=document.querySelector('main,[class*=\"chat-scroll\"],[class*=\"hatch-chat-scroll\"]')||document.body;"
+        "w.__m2aScope=sc;}"
+        "var bs=[].slice.call(sc.querySelectorAll('div[class*=\"hatch-chat-groupable-bubble\"]'))"
         ".filter(function(b){return /hatch-agent-bubble-bg/.test(b.className||'');});"
-        "var nonEmpty=bs.filter(function(b){return ((b.innerText||'').trim().length)>0;});"
-        "var txt=nonEmpty.length?(nonEmpty[nonEmpty.length-1].innerText||'').trim():'';"
+        "var cnt=0;"
+        "for(var j=0;j<bs.length;j++){if((bs[j].textContent||'').trim())cnt++;}"
+        "var seen=0,txt='';"
+        "for(var j=bs.length-1;j>=0&&seen<3;j--){"
+        "if(!((bs[j].textContent||'').trim()))continue;"
+        "seen++;"
+        "var it=(bs[j].innerText||'').trim();"
+        "if(it){txt=it;break;}}"
         "var stop=!!(document.querySelector('[data-testid=\"hatch-composer-stop-button\"]')"
         "||document.querySelector('button[aria-label*=\"Stop\" i]')"
         "||document.querySelector('button[aria-label*=\"停止\"]'));"
-        "return JSON.stringify({cnt:nonEmpty.length,total:bs.length,txt:txt,stop:stop});})()"
+        "return JSON.stringify({cnt:cnt,total:bs.length,txt:txt,stop:stop});})()"
     )
 
     def _agent_text(self) -> str:

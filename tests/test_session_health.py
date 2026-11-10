@@ -24,9 +24,12 @@ def check(root, home, observe):
             assert condition, message
 
     def account(prior=True, expiry=True):
-        a = app.store.add_account({'hatch_sess': 'fixture'}, cookies_exp={'hatch_vml': 1900012345} if expiry else {})
-        a.update(ok=prior, last_keepalive=1899999900, synced_at=1899999900)
-        return a
+        created = app.store.add_account({'hatch_sess': 'fixture'},
+                                        cookies_exp={'hatch_vml': 1900012345} if expiry else {})
+        # Store snapshots are deep copies now; seed runtime state explicitly.
+        app.store.update_account_runtime(created['id'], ok=prior,
+                                         last_keepalive=1899999900, synced_at=1899999900)
+        return app.store.get_account(created['id'])
 
     def response(code, body=None):
         def decode():
@@ -47,27 +50,28 @@ def check(root, home, observe):
     for prior in (True, None, False):
         for name, reply in cases:
             a = account(prior)
-            before = copy.deepcopy(a)
+            before = copy.deepcopy(app.store.get_account(a['id']))
             with patch('requests.get', side_effect=reply if isinstance(reply, Exception) else None, return_value=reply) as get:
                 result = app._probe_account_sync(a['id'])
+            cur = app.store.get_account(a['id'])
             expected_ok = True if name == 'assigned' else False if name == '401' else prior
-            expect(a['ok'] is expected_ok, f'{name}: account state changed incorrectly')
+            expect(cur['ok'] is expected_ok, f'{name}: account state changed incorrectly')
             expect(result['ok'] is (name == 'assigned'), f'{name}: wrong probe result')
             expect(get.call_args.kwargs.get('allow_redirects') is False, 'session must not follow redirects')
             if name != 'assigned':
-                expect(all(a[k] == before[k] for k in protected), f'{name}: modified protected session data')
+                expect(all(cur[k] == before[k] for k in protected), f'{name}: modified protected session data')
             else:
-                expect(a['cookies']['hatch_sess'] == 'renewed-fixture', 'renewed cookie not saved')
-                expect(a['last_keepalive'] == 1900000000, 'successful keepalive not recorded')
-                expect(a['expires_at'] == 1900012345, 'expiry fabricated on success')
+                expect(cur['cookies']['hatch_sess'] == 'renewed-fixture', 'renewed cookie not saved')
+                expect(cur['last_keepalive'] == 1900000000, 'successful keepalive not recorded')
+                expect(cur['expires_at'] == 1900012345, 'expiry fabricated on success')
             if name in ('401', '403', '429', '503'):
-                expect('HTTP ' + name in a['note'], 'HTTP diagnostic missing')
-            print(json.dumps({'case': name, 'prior': prior, 'result_ok': result['ok'], 'stored_ok': a['ok'],
-                              'protected_unchanged': all(a[k] == before[k] for k in protected)}, sort_keys=True))
+                expect('HTTP ' + name in cur['note'], 'HTTP diagnostic missing')
+            print(json.dumps({'case': name, 'prior': prior, 'result_ok': result['ok'], 'stored_ok': cur['ok'],
+                              'protected_unchanged': all(cur[k] == before[k] for k in protected)}, sort_keys=True))
 
     for name in ('401', '403', '503', 'assigned'):
         a = account()
-        before = copy.deepcopy(a)
+        before = copy.deepcopy(app.store.get_account(a['id']))
         reply = next(r for n, r in cases if n == name)
         auth_error = False
         with patch('requests.get', return_value=reply):
@@ -75,22 +79,24 @@ def check(root, home, observe):
                 app._renew_and_persist(a['id'], force=True)
             except app.MuseAuthError:
                 auth_error = True
+        cur = app.store.get_account(a['id'])
         expect(auth_error is (name == '401'), name + ': pre-renew wrong exception')
-        expect(a['ok'] is (name != '401'), name + ': pre-renew wrong account state')
+        expect(cur['ok'] is (name != '401'), name + ': pre-renew wrong account state')
         if name in ('403', '503'):
-            expect(all(a[k] == before[k] for k in protected), 'failed pre-renew changed session data')
-        print('pre_renew', name, 'auth_error', auth_error, 'stored_ok', a['ok'])
+            expect(all(cur[k] == before[k] for k in protected), 'failed pre-renew changed session data')
+        print('pre_renew', name, 'auth_error', auth_error, 'stored_ok', cur['ok'])
 
     for prior in (True, None, False):
         a = account(prior)
-        before = copy.deepcopy(a)
+        before = copy.deepcopy(app.store.get_account(a['id']))
         app.store.touch_keepalive(a['id'], None, 'fixture diagnostic')
-        expect(a['ok'] is prior and all(a[k] == before[k] for k in protected), 'unknown touch changed state')
+        cur = app.store.get_account(a['id'])
+        expect(cur['ok'] is prior and all(cur[k] == before[k] for k in protected), 'unknown touch changed state')
     a = account(expiry=False)
-    before_expiry = a['expires_at']
+    before_expiry = app.store.get_account(a['id'])['expires_at']
     with patch('time.time', return_value=1900003600):
         app.store.touch_keepalive(a['id'], True)
-    expect(a['expires_at'] == before_expiry, 'estimated expiry advanced without renewed cookie')
+    expect(app.store.get_account(a['id'])['expires_at'] == before_expiry, 'estimated expiry advanced without renewed cookie')
 
     for error in (app.MuseAuthError('fixture auth'), app.MuseGenerationError('fixture loading')):
         for prior in (True, None, False):
@@ -98,7 +104,7 @@ def check(root, home, observe):
             with patch.object(app.engine, 'start'), patch.object(app.engine, 'refresh', side_effect=error):
                 asyncio.run(app.test_account(a['id']))
             want = False if isinstance(error, app.MuseAuthError) else prior
-            expect(a['ok'] is want, 'manual test misclassified account')
+            expect(app.store.get_account(a['id'])['ok'] is want, 'manual test misclassified account')
 
     for body, want in [('loading workspace', 'MuseGenerationError'), ('Sign in', 'MuseAuthError')]:
         page = SimpleNamespace(js=lambda script: body if 'innerText' in script else False,

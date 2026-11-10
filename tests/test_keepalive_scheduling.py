@@ -22,14 +22,15 @@ def test_maintenance_selection_does_not_count_as_use():
         cfg.ensure_dirs()
         store = Store(cfg)
         acc = store.add_account({"hatch_sess": "fixture"}, "fixture")
-        acc["last_used"] = 1234
-        acc["use_count"] = 7
+        # Store snapshots are deep copies now; persist runtime stats explicitly.
+        store.update_account_runtime(acc["id"], last_used=1234, use_count=7)
         selected = store.pick_account(record_use=False)
         assert selected["id"] == acc["id"]
-        assert acc["last_used"] == 1234
-        assert acc["use_count"] == 7
+        current = store.get_account(acc["id"])
+        assert current["last_used"] == 1234
+        assert current["use_count"] == 7
         store.pick_account()
-        assert acc["use_count"] == 8
+        assert store.get_account(acc["id"])["use_count"] == 8
 
 
 def test_keepalive_only_runs_when_due():
